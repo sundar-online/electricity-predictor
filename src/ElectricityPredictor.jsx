@@ -38,11 +38,20 @@ function monthLabel(rec) {
 // Main component
 // ============================================================
 const ElectricityPredictor = () => {
-  const [results,       setResults]       = useState(null);
-  const [loading,       setLoading]       = useState(false);
-  const [loadingStatus, setLoadingStatus] = useState('');
-  const [lstmEpoch,     setLstmEpoch]     = useState(null);   // {epoch, loss}
-  const [prediction,    setPrediction]    = useState(null);
+  const [results,    setResults]    = useState(null);
+  const [loading,    setLoading]    = useState(false);
+  const [prediction, setPrediction] = useState(null);
+
+  // ── Separate progress state per model ──────────────────────
+  // status: 'idle' | 'training' | 'completed' | 'error'
+  const [rfStatus,   setRfStatus]   = useState({ status: 'idle', label: '' });
+  const [lstmStatus, setLstmStatus] = useState({
+    status: 'idle',
+    epoch:  0,
+    totalEpochs: 50,
+    loss:   null,
+    label:  '',
+  });
 
   // Prediction form inputs — match EB billing features
   const [inputFeatures, setInputFeatures] = useState({
@@ -61,10 +70,15 @@ const ElectricityPredictor = () => {
     setResults(null);
     setPrediction(null);
 
+    // Reset both model statuses independently
+    setRfStatus({   status: 'idle', label: '' });
+    setLstmStatus({ status: 'idle', epoch: 0, totalEpochs: 50, loss: null, label: '' });
+
     try {
       // ── Step 1: Prepare data ──────────────────────────────
-      setLoadingStatus('Preparing EB billing data…');
-      await new Promise((r) => setTimeout(r, 50)); // allow UI to update
+      setRfStatus((s)   => ({ ...s, status: 'training', label: 'Preparing data…' }));
+      setLstmStatus((s) => ({ ...s, status: 'idle',     label: 'Waiting…' }));
+      await new Promise((r) => setTimeout(r, 50)); // let React flush the state
 
       const prep = prepareAllData(ebBillingData, SEQ_LEN, TEST_RATIO);
       const {
@@ -75,96 +89,109 @@ const ElectricityPredictor = () => {
       } = prep;
 
       // ── Step 2: Train Random Forest ───────────────────────
-      setLoadingStatus('Training Random Forest (25 trees)…');
+      // RF state: training
+      setRfStatus((s) => ({ ...s, status: 'training', label: 'Training 25 trees…' }));
       await new Promise((r) => setTimeout(r, 50));
 
-      const rf = new RandomForest({
-        nTrees:   25,
-        maxDepth: 7,
-        minSamples: 3,
-      });
+      const rf = new RandomForest({ nTrees: 25, maxDepth: 7, minSamples: 3 });
       rf.fit(rfTrain.X, rfTrain.y);
 
-      const rfTrainPred = rf.predict(rfTrain.X);
-      const rfTestPred  = rf.predict(rfTest.X);
+      const rfTrainPred    = rf.predict(rfTrain.X);
+      const rfTestPred     = rf.predict(rfTest.X);
       const rfTrainMetrics = calculateMetrics(rfTrain.y, rfTrainPred);
       const rfTestMetrics  = calculateMetrics(rfTest.y,  rfTestPred);
       const rfSeasonMetrics = calculateSeasonalMetrics(rfTest.y, rfTestPred, rfTest.seasons);
 
-      // ── Step 3: Train LSTM ────────────────────────────────
-      setLoadingStatus('Training LSTM — epoch 0 / 50…');
-      setLstmEpoch({ epoch: 0, loss: null });
-      await new Promise((r) => setTimeout(r, 50));
+      // RF state: completed — update ONLY RF state, never touch lstmStatus here
+      setRfStatus((s) => ({
+        ...s,
+        status: 'completed',
+        label:  `MAE ${rfTestMetrics.mae.toFixed(2)} kWh · RMSE ${rfTestMetrics.rmse.toFixed(2)} kWh · R² ${rfTestMetrics.r2.toFixed(3)}`,
+      }));
 
+      // ── Step 3: Train LSTM ────────────────────────────────
       const EPOCHS = 50;
+
+      // LSTM state: training — update ONLY lstmStatus, never touch rfStatus here
+      setLstmStatus((s) => ({ ...s, status: 'training', epoch: 0, label: 'Starting…' }));
+      await new Promise((r) => setTimeout(r, 50));
 
       const { model: lstmModel } = await trainLSTM(
         lstmTrain.sequences,
         lstmTrain.targets,
-        lstmTest.sequences,  // use test as validation during training
+        lstmTest.sequences,
         lstmTest.targets,
         { epochs: EPOCHS, batchSize: 8, lstmUnits: 32, dropout: 0.1, learningRate: 0.01 },
+        // Per-epoch callback — only touches lstmStatus, leaves rfStatus untouched
         (epoch, logs) => {
-          setLstmEpoch({ epoch: epoch + 1, loss: logs.loss?.toFixed(5) });
-          setLoadingStatus(`Training LSTM — epoch ${epoch + 1} / ${EPOCHS}  (loss: ${logs.loss?.toFixed(5)})`);
+          setLstmStatus((s) => ({
+            ...s,
+            status: 'training',
+            epoch:  epoch + 1,
+            loss:   logs.loss != null ? parseFloat(logs.loss.toFixed(5)) : null,
+            label:  `Epoch ${epoch + 1} / ${EPOCHS}`,
+          }));
         }
       );
 
       // ── Step 4: LSTM predictions ──────────────────────────
-      setLoadingStatus('Generating LSTM predictions…');
-      await new Promise((r) => setTimeout(r, 50));
+      setLstmStatus((s) => ({ ...s, label: 'Generating predictions…' }));
+      await new Promise((r) => setTimeout(r, 30));
 
-      const lstmScaledPred  = await predictLSTM(lstmModel, lstmTest.sequences);
-      // Inverse-transform scaled predictions back to kWh
-      const lstmTestPred    = scaler.inverseTransformTarget(lstmScaledPred);
-      // Inverse-transform scaled targets for ground truth
-      const lstmTestActual  = scaler.inverseTransformTarget(lstmTest.targets);
+      const lstmScaledPred = await predictLSTM(lstmModel, lstmTest.sequences);
+      const lstmTestPred   = scaler.inverseTransformTarget(lstmScaledPred);
+      const lstmTestActual = scaler.inverseTransformTarget(lstmTest.targets);
 
-      const lstmTestMetrics   = calculateMetrics(lstmTestActual, lstmTestPred);
-      // Map season labels from testData (aligned with lstmTestActual)
-      const lstmTestSeasons = testData
-        .slice(SEQ_LEN - 1)           // first seqLen-1 test records are used as context
-        .map((d) => d.season);
-      // Pad/trim to match prediction length
-      const trimmedSeasons = lstmTestSeasons.slice(0, lstmTestActual.length);
+      const lstmTestMetrics = calculateMetrics(lstmTestActual, lstmTestPred);
+
+      // Seasons aligned with testData[0..N_test-1] — NO offset needed.
+      // lstmTest.targets[j] is already the prediction target for testData[j].
+      const lstmTestSeasons = testData.map((d) => d.season);
       const lstmSeasonMetrics = calculateSeasonalMetrics(
-        lstmTestActual, lstmTestPred, trimmedSeasons
+        lstmTestActual, lstmTestPred, lstmTestSeasons
       );
 
-      // ── Step 5: Build comparison timeline ────────────────
-      //   RF test is aligned with testData; LSTM test starts SEQ_LEN steps later
-      const rfLabels  = testData.map(monthLabel);
-      const lstmStart = SEQ_LEN - 1; // offset within testData
-
-      // Build unified chart data — show only RF predictions for early months,
-      // both once LSTM kicks in
-      const comparisonData = rfTestPred.map((rfPred, i) => ({
-        label:    rfLabels[i],
-        actual:   rfTest.y[i],
-        rf:       parseFloat(rfPred.toFixed(2)),
-        lstm:     i >= lstmStart
-          ? parseFloat((lstmTestPred[i - lstmStart] ?? null)?.toFixed(2))
-          : null,
-        season:   rfTest.seasons[i],
+      // LSTM state: completed — only touches lstmStatus
+      setLstmStatus((s) => ({
+        ...s,
+        status: 'completed',
+        epoch:  EPOCHS,
+        label:  `MAE ${lstmTestMetrics.mae.toFixed(2)} kWh · RMSE ${lstmTestMetrics.rmse.toFixed(2)} kWh · R² ${lstmTestMetrics.r2.toFixed(3)}`,
       }));
 
-      // ── Step 6: Best model ────────────────────────────────
+      // ── Step 5: Build comparison chart data ───────────────
+      // lstmTestPred[i] corresponds to testData[i] — no offset required.
+      // RF and LSTM are both aligned to the same testData indices.
+      const rfLabels = testData.map(monthLabel);
+
+      const comparisonData = rfTestPred.map((rfPred, i) => ({
+        label:  rfLabels[i],
+        actual: rfTest.y[i],
+        rf:     parseFloat(rfPred.toFixed(2)),
+        lstm:   lstmTestPred[i] != null
+          ? parseFloat(lstmTestPred[i].toFixed(2))
+          : null,
+        season: rfTest.seasons[i],
+      }));
+
+      // ── Step 6: Determine best model and store all results ─
       const bestModel = rfTestMetrics.rmse <= lstmTestMetrics.rmse ? 'rf' : 'lstm';
 
+      // setResults is a single atomic update containing BOTH models
       setResults({
         rf: {
           ...rfTestMetrics,
-          trainMetrics: rfTrainMetrics,
+          trainMetrics:  rfTrainMetrics,
           seasonMetrics: rfSeasonMetrics,
-          model: rf,
-          predictions: rfTestPred,
+          model:         rf,
+          predictions:   rfTestPred,
         },
         lstm: {
           ...lstmTestMetrics,
           seasonMetrics: lstmSeasonMetrics,
-          tfModel: lstmModel,
-          predictions: lstmTestPred,
-          actual: lstmTestActual,
+          tfModel:       lstmModel,
+          predictions:   lstmTestPred,
+          actual:        lstmTestActual,
         },
         bestModel,
         comparisonData,
@@ -174,10 +201,11 @@ const ElectricityPredictor = () => {
         lstmModel,
       });
 
-      setLoadingStatus('');
     } catch (err) {
       console.error('Training error:', err);
-      setLoadingStatus(`Error: ${err.message}`);
+      // Mark whichever model was active as errored without touching the other
+      setRfStatus((s)   => s.status === 'training' ? { ...s, status: 'error', label: err.message } : s);
+      setLstmStatus((s) => s.status === 'training' ? { ...s, status: 'error', label: err.message } : s);
     } finally {
       setLoading(false);
     }
@@ -334,10 +362,7 @@ const ElectricityPredictor = () => {
           Monthly electricity forecasting using <strong>Random Forest</strong> and{' '}
           <strong>LSTM</strong> on EB billing data (Jan&nbsp;2020 – Dec&nbsp;2024)
         </p>
-        <p className="text-xs text-gray-400 mb-4">
-          Dataset: 60-month synthetic EB billing dataset (Tamil Nadu residential pattern).
-          Replace <code>src/data/ebBillingData.js</code> with real EB data when available.
-        </p>
+
 
         <button
           onClick={trainModels}
@@ -349,33 +374,90 @@ const ElectricityPredictor = () => {
         </button>
       </div>
 
-      {/* ── Loading / Training Progress ── */}
-      {loading && (
+      {/* ── Training Progress — shown whenever either model has started, persists after completion ── */}
+      {(loading || rfStatus.status !== 'idle' || lstmStatus.status !== 'idle') && (
         <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
-          <h3 className="text-lg font-semibold text-gray-700 mb-3">
-            ⏳ Training Progress
-          </h3>
-          <p className="text-sm text-blue-700 font-medium mb-2">{loadingStatus}</p>
+          <h3 className="text-lg font-semibold text-gray-700 mb-4">⏳ Training Progress</h3>
 
-          {lstmEpoch && (
-            <div className="mt-2">
-              <div className="flex justify-between text-xs text-gray-500 mb-1">
-                <span>LSTM Epochs</span>
-                <span>{lstmEpoch.epoch} / 50</span>
+          <div className="space-y-4">
+            {/* ── Random Forest status card ── */}
+            <div className={`rounded-lg p-4 border-2 ${
+              rfStatus.status === 'completed' ? 'border-green-300 bg-green-50'
+              : rfStatus.status === 'error'   ? 'border-red-300   bg-red-50'
+              : rfStatus.status === 'training' ? 'border-blue-300  bg-blue-50'
+              : 'border-gray-200 bg-gray-50'
+            }`}>
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <Trees size={18} className="text-green-600" />
+                  <span className="font-semibold text-gray-800">Random Forest</span>
+                </div>
+                {rfStatus.status === 'completed' && <CheckCircle size={18} className="text-green-500" />}
+                {rfStatus.status === 'error'     && <AlertCircle size={18} className="text-red-500"   />}
+                {rfStatus.status === 'training'  && (
+                  <span className="text-xs text-blue-600 font-medium animate-pulse">Training…</span>
+                )}
               </div>
-              <div className="w-full bg-gray-200 rounded-full h-2">
-                <div
-                  className="bg-purple-500 h-2 rounded-full transition-all duration-200"
-                  style={{ width: `${(lstmEpoch.epoch / 50) * 100}%` }}
-                />
-              </div>
-              {lstmEpoch.loss && (
-                <p className="text-xs text-gray-500 mt-1">
-                  Loss: {lstmEpoch.loss}
-                </p>
-              )}
+              <p className={`text-xs mt-1 ${
+                rfStatus.status === 'completed' ? 'text-green-700'
+                : rfStatus.status === 'error'   ? 'text-red-600'
+                : 'text-gray-500'
+              }`}>
+                {rfStatus.status === 'completed' && '✓ Completed — '}
+                {rfStatus.label || (rfStatus.status === 'idle' ? 'Waiting…' : '')}
+              </p>
             </div>
-          )}
+
+            {/* ── LSTM status card ── */}
+            <div className={`rounded-lg p-4 border-2 ${
+              lstmStatus.status === 'completed' ? 'border-purple-300 bg-purple-50'
+              : lstmStatus.status === 'error'   ? 'border-red-300   bg-red-50'
+              : lstmStatus.status === 'training' ? 'border-purple-200 bg-purple-50'
+              : 'border-gray-200 bg-gray-50'
+            }`}>
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <Brain size={18} className="text-purple-600" />
+                  <span className="font-semibold text-gray-800">LSTM</span>
+                </div>
+                {lstmStatus.status === 'completed' && <CheckCircle size={18} className="text-purple-500" />}
+                {lstmStatus.status === 'error'     && <AlertCircle size={18} className="text-red-500"   />}
+                {lstmStatus.status === 'training'  && (
+                  <span className="text-xs text-purple-600 font-medium animate-pulse">Training…</span>
+                )}
+              </div>
+
+              {/* Epoch progress — only while training or after completion */}
+              {(lstmStatus.status === 'training' || lstmStatus.status === 'completed') && (
+                <div className="mt-2">
+                  <div className="flex justify-between text-xs text-gray-500 mb-1">
+                    <span>Epochs</span>
+                    <span>{lstmStatus.epoch} / {lstmStatus.totalEpochs}</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className={`h-2 rounded-full transition-all duration-200 ${
+                        lstmStatus.status === 'completed' ? 'bg-purple-500' : 'bg-purple-400'
+                      }`}
+                      style={{ width: `${(lstmStatus.epoch / lstmStatus.totalEpochs) * 100}%` }}
+                    />
+                  </div>
+                  {lstmStatus.loss != null && lstmStatus.status === 'training' && (
+                    <p className="text-xs text-gray-500 mt-1">Loss: {lstmStatus.loss}</p>
+                  )}
+                </div>
+              )}
+
+              <p className={`text-xs mt-1 ${
+                lstmStatus.status === 'completed' ? 'text-purple-700'
+                : lstmStatus.status === 'error'   ? 'text-red-600'
+                : 'text-gray-500'
+              }`}>
+                {lstmStatus.status === 'completed' && '✓ Completed — '}
+                {lstmStatus.label || (lstmStatus.status === 'idle' ? 'Waiting for Random Forest…' : '')}
+              </p>
+            </div>
+          </div>
         </div>
       )}
 
@@ -543,11 +625,11 @@ const ElectricityPredictor = () => {
                 </p>
               </div>
               <div className="text-center">
-                <p className="text-sm text-gray-600 mb-1">Best Model MAE</p>
+                <p className="text-sm text-gray-600 mb-1">Best Model RMSE</p>
                 <p className="text-2xl font-bold text-green-600">
                   {results.bestModel === 'rf'
-                    ? results.rf.mae.toFixed(2)
-                    : results.lstm.mae.toFixed(2)}{' '}
+                    ? results.rf.rmse.toFixed(2)
+                    : results.lstm.rmse.toFixed(2)}{' '}
                   kWh
                 </p>
               </div>
