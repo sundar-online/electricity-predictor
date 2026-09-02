@@ -5,25 +5,41 @@
  *   - Bootstrap sampling (bagging) per tree
  *   - Random feature subsets at each split (feature randomness)
  *   - Averaging predictions across all trees
+ *   - Seeded Pseudo-Random Number Generator (PRNG) for reproducible training
  *
- * Hyperparameters (adjustable via constructor options):
+ * Hyperparameters:
  *   nTrees           : number of trees in the ensemble (default 25)
  *   maxDepth         : maximum tree depth (default 7)
  *   minSamples       : minimum samples required to split a node (default 3)
  *   featureSubsetSize: how many features to consider at each split
  *                      (default: floor(sqrt(total features)))
+ *   seed             : optional integer seed for reproducibility
  */
+
+// ---------------------------------------------------------------------------
+// Seeded PRNG (Mulberry32)
+// ---------------------------------------------------------------------------
+export function createPrng(seed = 42) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return (t >>> 0) / 4294967296;
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Internal Decision Tree (CART — regression)
 // ---------------------------------------------------------------------------
 
 class RegressionTree {
-  constructor(maxDepth, minSamples, featureSubsetSize) {
-    this.maxDepth         = maxDepth;
-    this.minSamples       = minSamples;
+  constructor(maxDepth, minSamples, featureSubsetSize, rng = Math.random) {
+    this.maxDepth          = maxDepth;
+    this.minSamples        = minSamples;
     this.featureSubsetSize = featureSubsetSize;
-    this.root             = null;
+    this.rng               = rng;
+    this.root              = null;
   }
 
   // ------- Public API -------
@@ -63,10 +79,10 @@ class RegressionTree {
   }
 
   _bestSplit(X, y) {
-    // Random feature subset
+    // Random feature subset using seeded rng
     const allFeatures     = Object.keys(X[0]);
     const subsetSize      = Math.min(this.featureSubsetSize, allFeatures.length);
-    const shuffled        = [...allFeatures].sort(() => Math.random() - 0.5);
+    const shuffled        = [...allFeatures].sort(() => this.rng() - 0.5);
     const candidateFeats  = shuffled.slice(0, subsetSize);
 
     let bestMse   = Infinity;
@@ -118,8 +134,8 @@ class RegressionTree {
   }
 
   _weightedMse(leftY, rightY) {
-    const totalN  = leftY.length + rightY.length;
-    const leftMse = this._mse(leftY);
+    const totalN   = leftY.length + rightY.length;
+    const leftMse  = this._mse(leftY);
     const rightMse = this._mse(rightY);
     return (leftMse * leftY.length + rightMse * rightY.length) / totalN;
   }
@@ -145,17 +161,21 @@ export class RandomForest {
    * @param {number} options.maxDepth          - Max tree depth (default 7)
    * @param {number} options.minSamples        - Min samples to split (default 3)
    * @param {number} options.featureSubsetSize - Features per split (default sqrt(nFeatures))
+   * @param {number} options.seed              - Seed for PRNG (optional)
    */
   constructor({
-    nTrees           = 25,
-    maxDepth         = 7,
-    minSamples       = 3,
+    nTrees            = 25,
+    maxDepth          = 7,
+    minSamples        = 3,
     featureSubsetSize = null,
+    seed              = null,
   } = {}) {
     this.nTrees            = nTrees;
     this.maxDepth          = maxDepth;
     this.minSamples        = minSamples;
-    this.featureSubsetSize = featureSubsetSize; // resolved at fit-time if null
+    this.featureSubsetSize = featureSubsetSize;
+    this.seed              = seed;
+    this.rng               = seed !== null ? createPrng(seed) : Math.random;
     this.trees             = [];
   }
 
@@ -171,12 +191,12 @@ export class RandomForest {
     const subsetSize = this.featureSubsetSize ?? Math.max(1, Math.floor(Math.sqrt(nFeatures)));
 
     for (let t = 0; t < this.nTrees; t++) {
-      // Bootstrap sample (sampling with replacement)
-      const bootstrapIdx = Array.from({ length: n }, () => Math.floor(Math.random() * n));
+      // Bootstrap sample (sampling with replacement using seeded rng)
+      const bootstrapIdx = Array.from({ length: n }, () => Math.floor(this.rng() * n));
       const bootX        = bootstrapIdx.map((i) => X[i]);
       const bootY        = bootstrapIdx.map((i) => y[i]);
 
-      const tree = new RegressionTree(this.maxDepth, this.minSamples, subsetSize);
+      const tree = new RegressionTree(this.maxDepth, this.minSamples, subsetSize, this.rng);
       tree.fit(bootX, bootY);
       this.trees.push(tree);
     }

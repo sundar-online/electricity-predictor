@@ -13,9 +13,10 @@
  * Hyperparameters (all adjustable):
  *   LSTM_UNITS   = 32
  *   DROPOUT      = 0.1
- *   EPOCHS       = 50
+ *   EPOCHS       = 35
  *   BATCH_SIZE   = 8
  *   LEARNING_RATE= 0.01
+ *   SEED         = optional integer seed for reproducible layer initialization
  */
 
 import * as tf from '@tensorflow/tfjs';
@@ -26,9 +27,10 @@ import * as tf from '@tensorflow/tfjs';
 export const DEFAULT_HYPERPARAMS = {
   lstmUnits:    32,
   dropout:      0.1,
-  epochs:       50,
+  epochs:       35,
   batchSize:    8,
   learningRate: 0.01,
+  seed:         42,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,23 +45,34 @@ export const DEFAULT_HYPERPARAMS = {
  * @returns {tf.Sequential}
  */
 export function buildLSTMModel(seqLen, nFeatures, params = {}) {
-  const hp    = { ...DEFAULT_HYPERPARAMS, ...params };
+  const hp   = { ...DEFAULT_HYPERPARAMS, ...params };
+  const seed = hp.seed != null ? hp.seed : 42;
   const model = tf.sequential();
 
-  // LSTM layer
+  // LSTM layer with explicit seeded initializers
   model.add(
     tf.layers.lstm({
-      units:          hp.lstmUnits,
-      inputShape:     [seqLen, nFeatures],
-      returnSequences: false,
+      units:                hp.lstmUnits,
+      inputShape:           [seqLen, nFeatures],
+      returnSequences:      false,
+      kernelInitializer:    tf.initializers.glorotUniform({ seed }),
+      recurrentInitializer:  tf.initializers.orthogonal({ seed }),
+      biasInitializer:      'zeros',
     })
   );
 
   // Dropout for regularisation
-  model.add(tf.layers.dropout({ rate: hp.dropout }));
+  model.add(tf.layers.dropout({ rate: hp.dropout, seed }));
 
   // Dense output layer (regression → linear activation)
-  model.add(tf.layers.dense({ units: 1, activation: 'linear' }));
+  model.add(
+    tf.layers.dense({
+      units:             1,
+      activation:        'linear',
+      kernelInitializer: tf.initializers.glorotUniform({ seed }),
+      biasInitializer:   'zeros',
+    })
+  );
 
   model.compile({
     optimizer: tf.train.adam(hp.learningRate),
@@ -92,8 +105,8 @@ export async function trainLSTM(
   params     = {},
   onEpochEnd = null
 ) {
-  const hp       = { ...DEFAULT_HYPERPARAMS, ...params };
-  const seqLen   = trainSeqs[0].length;
+  const hp        = { ...DEFAULT_HYPERPARAMS, ...params };
+  const seqLen    = trainSeqs[0].length;
   const nFeatures = trainSeqs[0][0].length;
 
   const model = buildLSTMModel(seqLen, nFeatures, hp);
@@ -102,9 +115,9 @@ export async function trainLSTM(
   const xTrain = tf.tensor3d(trainSeqs);
   const yTrain = tf.tensor2d(trainTgts, [trainTgts.length, 1]);
 
-  const hasVal   = valSeqs.length > 0;
-  const xVal     = hasVal ? tf.tensor3d(valSeqs) : null;
-  const yVal     = hasVal ? tf.tensor2d(valTgts, [valTgts.length, 1]) : null;
+  const hasVal = valSeqs.length > 0;
+  const xVal   = hasVal ? tf.tensor3d(valSeqs) : null;
+  const yVal   = hasVal ? tf.tensor2d(valTgts, [valTgts.length, 1]) : null;
 
   const fitConfig = {
     epochs:    hp.epochs,

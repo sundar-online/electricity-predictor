@@ -232,21 +232,20 @@ export function prepareAllData(rawData, seqLen = 4, testRatio = 0.2) {
 
   const scaler        = fitMinMaxScaler(trainMatrix);
   const scaledTrain   = scaler.transform(trainMatrix);
-  // scaledTest not used directly — test sequences are built from fullScaled below
-  // (which combines train+test so context from end of training set is available)
 
   // 5. Sliding-window sequences for LSTM
-  // Training sequences come from scaled training data only
+  // Training sequences from training data
   const lstmTrain = createLSTMSequences(scaledTrain, seqLen);
 
-  // For test sequences we need the last (seqLen) records of training as context
+  // Test sequences: use last `seqLen` records from training as context for the first test month (Jan 2024),
+  // then slide across all test months through Dec 2024.
+  // This produces exactly testData.length (12) sequences corresponding 1-to-1 with testData[0..11].
   const fullScaled    = scaler.transform([...trainMatrix, ...testMatrix]);
-  const splitIdxFull  = trainMatrix.length;
-
-  // Build test sequences spanning the boundary (train context + test targets)
+  const splitIdx      = trainMatrix.length;
   const testSequences = [];
   const testTargets   = [];
-  for (let i = splitIdxFull - seqLen; i < fullScaled.length - seqLen; i++) {
+
+  for (let i = splitIdx - seqLen; i < fullScaled.length - seqLen; i++) {
     testSequences.push(fullScaled.slice(i, i + seqLen));
     testTargets.push(fullScaled[i + seqLen][0]);
   }
